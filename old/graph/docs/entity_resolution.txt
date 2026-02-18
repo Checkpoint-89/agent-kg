@@ -1,0 +1,66 @@
+Here’s the updated **entity resolution pipeline** with the **clarified vector principles** folded into steps 5 and 6:
+
+---
+
+## **Preprocess & store (offline)**
+
+1. **Normalize (lowercase, strip punctuation/accents)**
+
+   * **Principle:** remove superficial variation.
+   * **Implement:** ETL or Neo4j `apoc.text.*` before load; persist `normalized_*`.
+
+2. **Store structured fields (`name`, `company`, `function`, `aliases`)**
+
+   * **Principle:** keep attributes separate for targeted matching.
+
+3. **Property indexes** *(B-tree)*
+
+   * **Principle:** fast exact/starts-with lookups.
+
+4. **Full-text index** *(Lucene)*
+
+   * **Principle:** fuzzy token-based matching for typos, reordered words.
+
+5. **Vectors per property** (`name_vec`, `ctx_vec`) *(ANN/HNSW)*
+
+   * **Principle:**
+
+     * Vectorize one field at a time for **signal separation**, **per-query weighting**, **change isolation**, and **debuggability**.
+     * `name_vec`: `"person name: john doe | aliases: johnny doe"`
+     * `ctx_vec`: `"function: senior analyst | company: acme corp"`.
+
+6. **Optional `profile_vec` (short combined)** *(ANN/HNSW)*
+
+   * **Principle:**
+
+     * Recall booster across fields when queries are messy/incomplete or NER is uncertain.
+     * Cross-field matching (“J. at Acme”) even if no exact field match.
+     * Used only in **recall stage**, not precision.
+     * `profile_vec`: `"person: john doe | function: senior analyst | company: acme corp"`.
+
+---
+
+## **Query-time**
+
+7. **Extract fields from NL query** — map free text → structured attributes.
+8. **Normalize extracted fields** — same rules as offline normalization.
+
+### Recall stage
+
+9. **Vector search** on relevant fields (`name_vec`, `ctx_vec`) + optional `profile_vec` for messy queries.
+10. **Full-text search** with fuzziness (\~).
+11. **Combine results (union)** from all recall methods.
+
+### Precision stage
+
+12. **Re-rank with cosine similarity per field** — weight only the fields given in query.
+13. **String similarity (Jaro-Winkler / Levenshtein)** for short text precision.
+14. **Hard filters** (exact match on given fields like company).
+15. **Blend scores** — combine semantic + lexical + structural signals.
+16. **Select top above threshold**; else return top-k for disambiguation.
+
+---
+
+This way, **step 5 gives you precise, field-controllable vectors**, and **step 6 adds a “safety net” vector** for situations where the query doesn’t cleanly map to fields.
+
+I can make a **visual flow diagram** showing exactly how `name_vec`, `ctx_vec`, and `profile_vec` interact in recall/precision if you want it illustrated.
