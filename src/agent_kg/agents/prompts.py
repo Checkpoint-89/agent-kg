@@ -33,6 +33,10 @@ Classify each relation along exactly one axis:
 ## Constraints
 - Descriptions must be self-contained — understandable without the source document.
 - Verb phrases must be in infinitive form, without subject or object.
+- Each source quote must be an **exact, verbatim copy-paste** from the source
+  document — do NOT paraphrase, truncate, or summarise. Include at least one full
+  sentence (minimum ~40 characters). If the relation is evidenced in multiple
+  passages, provide multiple quotes.
 
 {ontology_section}
 
@@ -84,7 +88,7 @@ Assign entities to semantic roles for the following relation.
 - **Type**: {relation_type}
 - **Definition**: {relation_definition}
 - **Description**: {relation_description}
-- **Quote**: {quote}
+- **Quotes**: {quote}
 
 ## Source document
 {document_text}

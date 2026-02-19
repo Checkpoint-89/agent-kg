@@ -24,6 +24,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -257,7 +258,7 @@ class ContextEntity(Entity):
 
     role: Literal["context"] = Field(
         "context",
-        description="Semantic role: legal, contractual, or organisational environment.",
+        description="Semantic role: normative or organisational environment.",
     )
 
 
@@ -293,28 +294,28 @@ class Roles(BaseModel):
     agents: list[AgentEntity] = Field(
         ...,
         min_length=1,
-        description="Entities playing the agent role.",
+        description="Entities playing an agent role.",
     )
     themes: list[ThemeEntity] = Field(
         ...,
         min_length=1,
-        description="Entities playing the theme role.",
+        description="Entities playing a theme role.",
     )
     circumstances: list[CircumstanceEntity] = Field(
         default_factory=list,
-        description="Entities playing circumstantial roles.",
+        description="Entities playing a circumstantial role.",
     )
     context: list[ContextEntity] = Field(
         default_factory=list,
-        description="Entities playing the context role.",
+        description="Entities playing a context role.",
     )
     origin_destinations: list[OriginDestinationEntity] = Field(
         default_factory=list,
-        description="Entities playing origin/destination roles.",
+        description="Entities playing an origin/destination role.",
     )
     time_locations: list[TimeLocationEntity] = Field(
         default_factory=list,
-        description="Entities playing time/location roles.",
+        description="Entities playing a time/location role.",
     )
     candidate_entity_types: list[EntityType] = Field(
         default_factory=list,
@@ -340,14 +341,57 @@ class Roles(BaseModel):
 # Relation
 # =====================================================================
 
-class Provenance(BaseModel):
-    """Links a relation back to its source document."""
+class Source(BaseModel):
+    """Links a relation back to its source document (and optionally its chunk)."""
 
     document_id: str = Field(..., description="Source document identifier.")
-    quote: str = Field(
-        ...,
-        description="Verbatim excerpt from the source that best illustrates the relation.",
+    chunk_id: str | None = Field(
+        default=None,
+        description=(
+            "Chunk identifier within the document.  Set automatically "
+            "when the pipeline uses chunk-level extraction."
+        ),
     )
+    quotes: list[str] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Verbatim excerpts from the source text that evidence the relation. "
+            "Each item must be an EXACT, copy-paste substring of the source document "
+            "(at least one full sentence). Multiple quotes are allowed when the "
+            "relation is evidenced in separate passages."
+        ),
+    )
+
+    @field_validator("quotes", mode="after")
+    @classmethod
+    def _validate_quotes(cls, v: list[str], info: ValidationInfo) -> list[str]:
+        """Validate quote shape and (optionally) verify verbatimness.
+
+        If the caller provides a Pydantic validation context containing
+        `document_text`, each quote must be an exact substring of that
+        document text. This is intended to trigger automatic retries in
+        structured-extraction clients (e.g. instructor) via validation errors.
+        """
+        cleaned: list[str] = []
+        document_text = ""
+        if isinstance(getattr(info, "context", None), dict):
+            raw = info.context.get("document_text")
+            if isinstance(raw, str):
+                document_text = raw
+        for q in v:
+            q = q.strip()
+            if len(q) < 40:
+                raise ValueError(
+                    f"Quote too short ({len(q)} chars, minimum 40): '{q[:60]}'"
+                )
+            if document_text and q not in document_text:
+                raise ValueError(
+                    "Quote must be an exact, verbatim substring of the source document: "
+                    f"'{q[:80]}...'"
+                )
+            cleaned.append(q)
+        return cleaned
 
 
 class RawRelation(BaseModel):
@@ -368,7 +412,7 @@ class RawRelation(BaseModel):
         ),
     )
     relation_type: RelationType = Field(..., description="Type of the relation.")
-    provenance: Provenance = Field(..., description="Source document and supporting quote.")
+    source: Source = Field(..., description="Source document and supporting quotes.")
     confidence: float = Field(
         default=1.0, ge=0.0, le=1.0,
         description="LLM self-assessed extraction confidence.",
@@ -394,7 +438,7 @@ class RawRelation(BaseModel):
             description=self.description,
             relation_type=self.relation_type,
             roles=roles,
-            provenance=self.provenance,
+            source=self.source,
             confidence=self.confidence,
         )
 
@@ -403,7 +447,7 @@ class Relation(BaseModel):
     """A relation extracted from a document.
 
     Relations are reified as first-class objects (not mere edges)
-    because they carry their own properties, provenance, and roles.
+    because they carry their own properties, source attribution, and roles.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -419,7 +463,7 @@ class Relation(BaseModel):
     )
     relation_type: RelationType = Field(..., description="Type of the relation.")
     roles: Roles = Field(..., description="Semantic roles and their entity assignments.")
-    provenance: Provenance = Field(..., description="Source document and supporting quote.")
+    source: Source = Field(..., description="Source document and supporting quotes.")
     confidence: float = Field(
         default=1.0, ge=0.0, le=1.0,
         description="LLM self-assessed extraction confidence.",
@@ -533,6 +577,14 @@ class ResolutionEntry(BaseModel):
     method: str = Field(
         ...,
         description="Resolution method: 'exact', 'embedding', or 'llm'.",
+    )
+    canonical_source: str = Field(
+        default="batch",
+        description=(
+            "Where the canonical entity came from: "
+            "'batch' (new, from current extraction) or "
+            "'graph' (linked to an existing KG entity)."
+        ),
     )
 
 

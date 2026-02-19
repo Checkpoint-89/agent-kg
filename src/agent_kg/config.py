@@ -217,6 +217,7 @@ class DomainConfig:
 
     # Models
     embedding_model: str = "text-embedding-3-small"
+    embedding_dimensions: int = 1536
     extraction_model: str = "gpt-4o"
     reasoning_model: str = "o3"
     validation_model: str = "gpt-4o-mini"

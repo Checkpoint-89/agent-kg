@@ -235,18 +235,22 @@ def _arbitrate_cluster(
 # Apply merges — mutate entities in-place
 # =====================================================================
 
-def _pick_canonical(mentions: list[_Mention]) -> tuple[str, str, str]:
+def _pick_canonical(mentions: list[_Mention]) -> tuple[str, str, str, bool]:
     """Pick canonical entity from the cluster.
 
     Priority: known entities (from graph) win unconditionally.
     Among equals, highest confidence wins.
+
+    Returns:
+        (name, label, definition, from_graph) — *from_graph* is True
+        when the chosen canonical originates from a known graph entity.
     """
     known = [m for m in mentions if m.is_known]
     if known:
         best = known[0]  # known entities are already canonical
     else:
         best = max(mentions, key=lambda m: m.entity.confidence)
-    return best.entity.name, best.entity.label, best.entity.definition
+    return best.entity.name, best.entity.label, best.entity.definition, best.is_known
 
 
 def _apply_merge(
@@ -390,13 +394,14 @@ def resolve_entities(
     for cluster in candidate_clusters:
         if not _needs_arbitration(cluster):
             # Single surface form → already resolved by Stage 1
-            canonical_name, canonical_label, canonical_def = _pick_canonical(cluster)
+            canonical_name, canonical_label, canonical_def, from_graph = _pick_canonical(cluster)
             report_entries.append(ResolutionEntry(
                 canonical_name=canonical_name,
                 canonical_label=canonical_label,
                 aliases=[],
                 mention_count=len(cluster),
                 method="exact",
+                canonical_source="graph" if from_graph else "batch",
             ))
             continue
 
@@ -411,12 +416,17 @@ def resolve_entities(
                     decision.canonical_label,
                     decision.canonical_definition,
                 )
+                from_graph = any(
+                    m.is_known and m.entity.name == decision.canonical_name
+                    for m in cluster
+                )
                 report_entries.append(ResolutionEntry(
                     canonical_name=decision.canonical_name,
                     canonical_label=decision.canonical_label,
                     aliases=aliases,
                     mention_count=len(cluster),
                     method="llm",
+                    canonical_source="graph" if from_graph else "batch",
                 ))
                 logger.info(
                     "LLM merge: %r ← %s (%s)",
@@ -428,13 +438,14 @@ def resolve_entities(
                 # LLM says don't merge — split back into sub-groups
                 sub_groups = _group_by_norm_key(cluster)
                 for _key, sub in sub_groups.items():
-                    cn, cl, cd = _pick_canonical(sub)
+                    cn, cl, cd, fg = _pick_canonical(sub)
                     report_entries.append(ResolutionEntry(
                         canonical_name=cn,
                         canonical_label=cl,
                         aliases=[],
                         mention_count=len(sub),
                         method="llm_rejected",
+                        canonical_source="graph" if fg else "batch",
                     ))
                 logger.info(
                     "LLM rejected merge for cluster with %d forms: %s",
@@ -443,7 +454,7 @@ def resolve_entities(
                 )
         else:
             # No LLM — merge by embedding proximity (confidence heuristic)
-            canonical_name, canonical_label, canonical_def = _pick_canonical(cluster)
+            canonical_name, canonical_label, canonical_def, from_graph = _pick_canonical(cluster)
             aliases = _apply_merge(
                 cluster, canonical_name, canonical_label, canonical_def,
             )
@@ -453,6 +464,7 @@ def resolve_entities(
                 aliases=aliases,
                 mention_count=len(cluster),
                 method="embedding",
+                canonical_source="graph" if from_graph else "batch",
             ))
 
     unique_after = len({(m.entity.label, m.entity.name) for m in mentions if not m.is_known})

@@ -35,6 +35,67 @@ logger = logging.getLogger(__name__)
 _MAX_ONTOLOGY_TYPES = 50
 
 
+def _build_ontology_section_from_graph_context(
+    graph_context: GraphContext,
+    *,
+    max_types: int,
+) -> str:
+    """Derive an ontology-like prompt section from retrieved graph context.
+
+    Today, `GraphContext` provides:
+    - `known_entities`: [{name, label, definition}, ...]
+    - `related_relations`: [{generic, verb, description}, ...]
+
+    We fold these into lightweight "known types" hints to bias extraction toward
+    existing labels/verbs, without requiring an explicit `OntologySchema`.
+    """
+    if graph_context.is_empty():
+        return ""
+
+    lines: list[str] = []
+
+    # Entity types (label → definition)
+    label_to_definition: dict[str, str] = {}
+    for ent in graph_context.known_entities:
+        label = (ent.get("label") or "").strip()
+        if not label or label in label_to_definition:
+            continue
+        definition = (ent.get("definition") or "").strip()
+        label_to_definition[label] = definition
+
+    if label_to_definition:
+        lines.append("## Known entity types (from graph context)")
+        for label, definition in list(label_to_definition.items())[:max_types]:
+            if definition:
+                lines.append(f"- **{label}**: {definition}")
+            else:
+                lines.append(f"- **{label}**")
+
+    # Relation types (verb → example generic/description)
+    verb_to_examples: dict[str, list[str]] = {}
+    for rel in graph_context.related_relations:
+        verb = (rel.get("verb") or "").strip()
+        if not verb:
+            continue
+        example = (rel.get("generic") or rel.get("description") or "").strip()
+        verb_to_examples.setdefault(verb, [])
+        if example and len(verb_to_examples[verb]) < 2 and example not in verb_to_examples[verb]:
+            verb_to_examples[verb].append(example)
+
+    if verb_to_examples:
+        if lines:
+            lines.append("")
+        lines.append("## Known relation verbs (from graph context)")
+        for verb, examples in list(verb_to_examples.items())[:max_types]:
+            if examples:
+                preview = examples[0][:160]
+                lines.append(f"- **{verb}**: e.g. {preview}")
+            else:
+                lines.append(f"- **{verb}**")
+
+    return "\n".join(lines)
+
+
 def extract_raw_relations(
     document_text: str,
     document_id: str,
@@ -48,7 +109,7 @@ def extract_raw_relations(
 
     Args:
         document_text: Pre-formatted document content.
-        document_id: Unique document identifier (for provenance).
+        document_id: Unique document identifier (for source attribution).
         client: An ``openai.OpenAI`` client instance.
         config: Domain configuration.
         graph_context: Optional context from prior graph state.
@@ -59,9 +120,21 @@ def extract_raw_relations(
     """
     instr_client = instructor.from_openai(client, mode=instructor.Mode.TOOLS_STRICT)
 
-    # Build ontology section (capped)
+    # Build context section
+    context_section = ""
+    if graph_context and not graph_context.is_empty():
+        context_section = graph_context.to_prompt_section()
+
+    # Build ontology section (prefer graph_context-derived ontology)
     ontology_section = ""
-    if ontology and ontology.relation_types:
+    if graph_context and not graph_context.is_empty():
+        ontology_section = _build_ontology_section_from_graph_context(
+            graph_context,
+            max_types=_MAX_ONTOLOGY_TYPES,
+        )
+
+    # Fallback: explicit ontology schema
+    if not ontology_section and ontology and ontology.relation_types:
         capped = ontology.relation_types[:_MAX_ONTOLOGY_TYPES]
         lines = ["## Known relation types (prefer these when appropriate)"]
         for t in capped:
@@ -70,11 +143,6 @@ def extract_raw_relations(
         if len(ontology.relation_types) > _MAX_ONTOLOGY_TYPES:
             lines.append(f"  … and {len(ontology.relation_types) - _MAX_ONTOLOGY_TYPES} more.")
         ontology_section = "\n".join(lines)
-
-    # Build context section
-    context_section = ""
-    if graph_context and not graph_context.is_empty():
-        context_section = graph_context.to_prompt_section()
 
     system_prompt = RELATION_EXTRACTION_SYSTEM.format(
         domain_name=config.domain_name,
@@ -92,12 +160,15 @@ def extract_raw_relations(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
+        # Pass source text into Pydantic validators so verbatim quote
+        # constraints can trigger built-in instructor retries.
+        validation_context={"document_text": document_text},
         max_retries=3,
     )
 
-    # Post-process: inject document_id
+    # Post-process: inject document_id (we don't require the LLM to get this right)
     for raw in result.relations:
-        raw.provenance.document_id = document_id
+        raw.source.document_id = document_id
 
     logger.info(
         "Extracted %d raw relations from document %s (model=%s).",

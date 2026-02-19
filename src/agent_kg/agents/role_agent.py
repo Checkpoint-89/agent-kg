@@ -89,7 +89,7 @@ def extract_roles(
         relation_description=raw_relation.description,
         relation_type=rel_type_label,
         relation_definition=raw_relation.relation_type.definition,
-        quote=raw_relation.provenance.quote,
+        quote="\n".join(raw_relation.source.quotes),
         document_text=document_text,
     )
 

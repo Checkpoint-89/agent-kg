@@ -48,14 +48,45 @@ from agent_kg.models.graph import (
     GraphEdge,
     GraphExporter,
     GraphNode,
+    Mention,
     Neo4jExporter,
     build_graph_elements,
+    generate_id,
+    generate_mention_id,
 )
 from agent_kg.models.ontology import OntologySchema
+from agent_kg.utils.chunking import Chunk, chunk_document
 from agent_kg.utils.embeddings import compute_embeddings
 from agent_kg.validation.rules import run_symbolic_validation
 
 logger = logging.getLogger(__name__)
+
+
+# ── Helpers ─────────────────────────────────────────────────────────
+
+def _overlap_length(text: str, query: str) -> int:
+    """Count the longest common substring length (approximate via shared chars)."""
+    # Fast heuristic: count how many characters of *query* appear in *text*.
+    # Sufficient for choosing the best chunk when no chunk fully contains the quote.
+    if not query:
+        return 0
+    t = set(range(len(text)))
+    overlap = 0
+    start = 0
+    for _ in range(len(query)):
+        pos = text.find(query[start : start + 1], max(0, start - 50))
+        if pos != -1 and pos in t:
+            overlap += 1
+        start += 1
+    # Simpler: just check character-by-character containment at boundaries.
+    # This is a rough proxy — we want the chunk with the most shared text.
+    best = 0
+    for i in range(len(text)):
+        j = 0
+        while i + j < len(text) and j < len(query) and text[i + j] == query[j]:
+            j += 1
+        best = max(best, j)
+    return best
 
 
 @dataclass
@@ -118,6 +149,12 @@ class Pipeline:
             self._exporter = Neo4jExporter(neo4j_uri, neo4j_auth, neo4j_database)
             self._context_retriever = ContextRetriever(
                 neo4j_uri, neo4j_auth, neo4j_database,
+                client=self._client,
+                embedding_model=config.embedding_model,
+            )
+            # Ensure vector indexes exist (entities + chunks).
+            self._exporter.ensure_vector_index(
+                dimensions=config.embedding_dimensions,
             )
 
     def close(self) -> None:
@@ -183,16 +220,38 @@ class Pipeline:
         if candidates:
             await self._run_arbiter(candidates)
 
+        # 4b. Snapshot original surface forms (before ER mutates entities)
+        surface_snapshot = self._snapshot_surface_forms(all_relations)
+
         # 5. Entity resolution
         all_relations, resolution_report = self._resolve_entities(all_relations)
 
-        # 6. Validate (fail-closed per relation)
-        valid_relations, violations_count, rejected_count = await self._validate(all_relations)
+        # 6. Chunk documents + assign chunk_ids (before validation)
+        doc_chunks = self._chunk_documents(documents)
+        self._assign_chunk_ids(all_relations, doc_chunks)
+        chunk_texts = {
+            c.chunk_id: c.text
+            for chunks in doc_chunks.values()
+            for c in chunks
+        }
 
-        # 7. Build graph & export
+        # 6b. Collect mentions (original surface forms → canonical entities)
+        mentions = self._collect_mentions(all_relations, surface_snapshot)
+
+        # 7. Validate (fail-closed per relation, chunk-scoped)
+        doc_texts = {d.id: d.text for d in documents}
+        valid_relations, violations_count, rejected_count = await self._validate(
+            all_relations, doc_texts=doc_texts, chunk_texts=chunk_texts,
+        )
+
+        # 8. Build graph & export (with mentions)
+        # Mentions from rejected relations are harmless — their Entity
+        # nodes won't exist, so REFERS_TO edges simply won't match.
         result = self._build_and_export(
             valid_relations,
             documents,
+            doc_chunks=doc_chunks,
+            mentions=mentions,
             violations_count=violations_count,
             rejected_relations_count=rejected_count,
             resolution_report=resolution_report,
@@ -232,16 +291,36 @@ class Pipeline:
         if candidates:
             await self._run_arbiter(candidates)
 
+        # 5b. Snapshot original surface forms (before ER mutates entities)
+        surface_snapshot = self._snapshot_surface_forms(all_relations)
+
         # 6. Entity resolution
         all_relations, resolution_report = self._resolve_entities(all_relations)
 
-        # 7. Validate
-        valid_relations, violations_count, rejected_count = await self._validate(all_relations)
+        # 7. Chunk documents + assign chunk_ids (before validation)
+        doc_chunks = self._chunk_documents(documents)
+        self._assign_chunk_ids(all_relations, doc_chunks)
+        chunk_texts = {
+            c.chunk_id: c.text
+            for chunks in doc_chunks.values()
+            for c in chunks
+        }
 
-        # 8. Build graph & export
+        # 7b. Collect mentions (original surface forms → canonical entities)
+        mentions = self._collect_mentions(all_relations, surface_snapshot)
+
+        # 8. Validate (chunk-scoped)
+        doc_texts = {d.id: d.text for d in documents}
+        valid_relations, violations_count, rejected_count = await self._validate(
+            all_relations, doc_texts=doc_texts, chunk_texts=chunk_texts,
+        )
+
+        # 9. Build graph & export
         result = self._build_and_export(
             valid_relations,
             documents,
+            doc_chunks=doc_chunks,
+            mentions=mentions,
             violations_count=violations_count,
             rejected_relations_count=rejected_count,
             resolution_report=resolution_report,
@@ -287,7 +366,7 @@ class Pipeline:
 
         relations: list[Relation] = []
         for raw in raw_relations:
-            doc_text = doc_texts.get(raw.provenance.document_id, "")
+            doc_text = doc_texts.get(raw.source.document_id, "")
             relation = extract_roles(
                 raw, doc_text, self._client, self._config,
                 ontology=self._ontology,
@@ -482,7 +561,7 @@ class Pipeline:
         """Run QC agent per document. Returns total flag count."""
         total_flags = 0
         for doc in documents:
-            doc_rels = [r for r in relations if r.provenance.document_id == doc.id]
+            doc_rels = [r for r in relations if r.source.document_id == doc.id]
             if not doc_rels:
                 continue
             agent, session = create_qc_agent(self._config, doc.text, doc_rels)
@@ -500,12 +579,21 @@ class Pipeline:
                     logger.info("  [%s] %s", flag.kind, flag.description[:80])
         return total_flags
 
-    async def _validate(self, relations: list[Relation]) -> tuple[list[Relation], int, int]:
+    async def _validate(
+        self,
+        relations: list[Relation],
+        doc_texts: dict[str, str] | None = None,
+        chunk_texts: dict[str, str] | None = None,
+    ) -> tuple[list[Relation], int, int]:
         """Validate relations.
 
         Policy: fail-closed *per relation*.
         - Relations that violate **error** invariants are blocked from export.
         - Warnings do not block export.
+
+        Args:
+            chunk_texts: Optional ``chunk_id → text`` mapping.  When provided,
+                quote-verbatim checks run against the chunk (tighter than doc).
 
         Returns:
             (valid_relations, violations_count, rejected_relations_count)
@@ -521,7 +609,10 @@ class Pipeline:
         # Evaluate violations at relation granularity so we can block only the violating facts.
         for rel in relations:
             rel_violations = run_symbolic_validation(
-                [rel], blocklist=self._config.generic_entity_blocklist,
+                [rel],
+                blocklist=self._config.generic_entity_blocklist,
+                doc_texts=doc_texts,
+                chunk_texts=chunk_texts,
             )
             all_violations.extend(rel_violations)
 
@@ -565,20 +656,44 @@ class Pipeline:
     ) -> tuple[list[Relation], ResolutionReport | None]:
         """Run entity resolution if enabled in config.
 
-        When a Neo4j graph exists, fetches the current entity catalog
-        so new mentions are resolved against known canonical entities
-        (cross-batch consistency).
+        When a Neo4j graph exists, retrieves candidate entities via
+        vector similarity (embedding-based entity linking) so that
+        new mentions are resolved against relevant existing entities
+        without fetching the full catalog.
         """
         if not self._config.entity_resolution_enabled:
             return relations, None
 
-        # Fetch existing entities from the graph (if available)
         known_entities: list[dict[str, str]] | None = None
         if self._context_retriever:
             try:
-                known_entities = self._context_retriever.fetch_all_entities()
+                # Collect unique mention embed texts
+                seen: set[tuple[str, str]] = set()
+                embed_texts: list[str] = []
+                for rel in relations:
+                    for ent in rel.roles.all_entities():
+                        key = (ent.label, ent.name)
+                        if key not in seen:
+                            seen.add(key)
+                            embed_texts.append(
+                                f"{ent.name} | {ent.label} | {ent.definition}"
+                            )
+
+                if embed_texts:
+                    mention_embeddings = compute_embeddings(
+                        embed_texts,
+                        self._client,
+                        self._config.embedding_model,
+                    )
+                    known_entities = self._context_retriever.find_similar_entities(
+                        mention_embeddings.tolist(),
+                        top_k=10,
+                    )
             except Exception:
-                logger.warning("Failed to fetch known entities for resolution.", exc_info=True)
+                logger.warning(
+                    "Vector-based entity candidate retrieval failed.",
+                    exc_info=True,
+                )
 
         return resolve_entities(
             relations, self._client, self._config,
@@ -590,18 +705,95 @@ class Pipeline:
         relations: list[Relation],
         documents: list[Document],
         *,
+        doc_chunks: dict[str, list[Chunk]] | None = None,
+        mentions: list[Mention] | None = None,
         violations_count: int,
         rejected_relations_count: int,
         resolution_report: ResolutionReport | None = None,
         qc_flags_count: int = 0,
     ) -> PipelineResult:
-        """Build graph elements and export to Neo4j."""
+        """Build graph elements and export to Neo4j.
+
+        When a Neo4j exporter is configured the method also:
+        - Embeds pre-computed chunks for the ``chunk_embeddings``
+          vector index.
+        - Computes entity embeddings for the ``entity_embeddings``
+          vector index.
+
+        Args:
+            doc_chunks: Pre-computed ``document_id → list[Chunk]`` mapping.
+                Chunking and ``chunk_id`` assignment happen upstream (before
+                validation) so that quote checks are chunk-scoped.
+            mentions: Mention objects linking surface forms to canonical
+                entities.  Translated into Mention graph nodes with
+                ``HAS_MENTION`` / ``REFERS_TO`` edges.
+        """
+        # ── Entity embeddings ───────────────────────────────────────
+        entity_embeddings: dict[str, list[float]] | None = None
+        if self._exporter:
+            seen: set[str] = set()
+            embed_texts: list[str] = []
+            node_ids: list[str] = []
+            for rel in relations:
+                for ent in rel.roles.all_entities():
+                    nid = generate_id({"label": ent.label, "name": ent.name})
+                    if nid not in seen:
+                        seen.add(nid)
+                        embed_texts.append(
+                            ent.to_embed
+                            or f"Entity class: {ent.label}. Definition: {ent.definition}"
+                        )
+                        node_ids.append(nid)
+
+            if embed_texts:
+                emb_array = compute_embeddings(
+                    embed_texts, self._client, self._config.embedding_model,
+                )
+                entity_embeddings = {
+                    nid: emb_array[i].tolist()
+                    for i, nid in enumerate(node_ids)
+                }
+
+        # ── Chunk embeddings ────────────────────────────────────────
+        if doc_chunks is None:
+            doc_chunks = self._chunk_documents(documents)
+
+        doc_chunk_embeddings: dict[str, dict[str, list[float]]] = {}
+        if self._exporter:
+            for doc in documents:
+                chunks = doc_chunks.get(doc.id, [])
+                if chunks:
+                    chunk_txts = [c.text for c in chunks]
+                    c_emb = compute_embeddings(
+                        chunk_txts, self._client, self._config.embedding_model,
+                    )
+                    doc_chunk_embeddings[doc.id] = {
+                        chunks[i].chunk_id: c_emb[i].tolist()
+                        for i in range(len(chunks))
+                    }
+
+        # ── Build graph elements ────────────────────────────────────
         all_nodes: list[GraphNode] = []
         all_edges: list[GraphEdge] = []
 
         for doc in documents:
-            doc_rels = [r for r in relations if r.provenance.document_id == doc.id]
-            nodes, edges = build_graph_elements(doc_rels, doc.id)
+            doc_rels = [r for r in relations if r.source.document_id == doc.id]
+            # Filter mentions for this document's chunks
+            doc_mentions: list[Mention] | None = None
+            if mentions:
+                doc_chunk_ids = {c.chunk_id for c in doc_chunks.get(doc.id, [])}
+                doc_mentions = [
+                    m for m in mentions
+                    if m.chunk_id in doc_chunk_ids or m.chunk_id is None
+                ] or None
+            nodes, edges = build_graph_elements(
+                doc_rels,
+                doc.id,
+                entity_embeddings=entity_embeddings,
+                chunks=doc_chunks.get(doc.id),
+                chunk_embeddings=doc_chunk_embeddings.get(doc.id),
+                mentions=doc_mentions,
+            )
             all_nodes.extend(nodes)
             all_edges.extend(edges)
 
@@ -620,6 +812,127 @@ class Pipeline:
             qc_flags_count=qc_flags_count,
             documents_processed=len(documents),
         )
+
+    @staticmethod
+    def _chunk_documents(
+        documents: list[Document],
+    ) -> dict[str, list[Chunk]]:
+        """Chunk all documents. Called before validation so chunk_ids
+        are available for chunk-scoped quote checks."""
+        doc_chunks: dict[str, list[Chunk]] = {}
+        for doc in documents:
+            doc_chunks[doc.id] = chunk_document(
+                doc.text,
+                doc.id,
+                max_tokens=1024,
+                overlap_tokens=128,
+            )
+        return doc_chunks
+
+    @staticmethod
+    def _assign_chunk_ids(
+        relations: list[Relation],
+        doc_chunks: dict[str, list[Chunk]],
+    ) -> None:
+        """Set ``source.chunk_id`` on each relation.
+
+        For each relation we find the chunk whose text contains the
+        first quote.  If no chunk matches (e.g. quote spans a boundary),
+        we pick the chunk with the largest overlap.
+        """
+        for rel in relations:
+            chunks = doc_chunks.get(rel.source.document_id, [])
+            if not chunks:
+                continue
+            quote = rel.source.quotes[0] if rel.source.quotes else ""
+            if not quote:
+                continue
+
+            # Exact containment (fast path)
+            for chunk in chunks:
+                if quote in chunk.text:
+                    rel.source.chunk_id = chunk.chunk_id
+                    break
+            else:
+                # Largest overlap heuristic
+                best_chunk = max(
+                    chunks,
+                    key=lambda c: _overlap_length(c.text, quote),
+                )
+                rel.source.chunk_id = best_chunk.chunk_id
+
+    @staticmethod
+    def _snapshot_surface_forms(
+        relations: list[Relation],
+    ) -> dict[int, list[tuple[str, str, str]]]:
+        """Capture original entity (name, label, role) before ER mutates them.
+
+        Returns a mapping of ``id(relation) → [(name, label, role), ...]``
+        preserving the order and identity of entities in each relation.
+        """
+        snapshot: dict[int, list[tuple[str, str, str]]] = {}
+        for rel in relations:
+            forms: list[tuple[str, str, str]] = []
+            for ent in rel.roles.agents:
+                forms.append((ent.name, ent.label, "agent"))
+            for ent in rel.roles.themes:
+                forms.append((ent.name, ent.label, "theme"))
+            for ent in rel.roles.circumstances:
+                forms.append((ent.name, ent.label, ent.role))  # type: ignore[attr-defined]
+            for ent in rel.roles.context:
+                forms.append((ent.name, ent.label, "context"))
+            for ent in rel.roles.origin_destinations:
+                forms.append((ent.name, ent.label, ent.role))  # type: ignore[attr-defined]
+            for ent in rel.roles.time_locations:
+                forms.append((ent.name, ent.label, ent.role))  # type: ignore[attr-defined]
+            snapshot[id(rel)] = forms
+        return snapshot
+
+    @staticmethod
+    def _collect_mentions(
+        relations: list[Relation],
+        surface_snapshot: dict[int, list[tuple[str, str, str]]],
+    ) -> list[Mention]:
+        """Build Mention objects from pre-ER surface forms and post-ER canonical entities.
+
+        Each entity occurrence becomes a Mention linking the original
+        surface form (from the snapshot) to the canonical entity (current
+        state after resolution).  The chunk_id comes from the relation's
+        source (set by ``_assign_chunk_ids``).
+        """
+        mentions: list[Mention] = []
+        seen: set[str] = set()  # deduplicate by mention_id
+
+        for rel in relations:
+            original_forms = surface_snapshot.get(id(rel), [])
+            canonical_entities = rel.roles.all_entities()
+
+            # Both lists have the same length and order (ER mutates in-place).
+            for (orig_name, orig_label, role), entity in zip(
+                original_forms, canonical_entities, strict=False,
+            ):
+                chunk_id = rel.source.chunk_id
+                mid = generate_mention_id(
+                    chunk_id, orig_name, entity.name, entity.label,
+                )
+                if mid in seen:
+                    continue
+                seen.add(mid)
+                mentions.append(Mention(
+                    mention_id=mid,
+                    surface_form=orig_name,
+                    entity_name=entity.name,
+                    entity_label=entity.label,
+                    chunk_id=chunk_id,
+                    role=role,
+                ))
+
+        logger.info(
+            "Collected %d mentions (%d with surface ≠ canonical).",
+            len(mentions),
+            sum(1 for m in mentions if m.surface_form != m.entity_name),
+        )
+        return mentions
 
     # ── Drift detection (pure compute) ─────────────────────────────
 
@@ -683,3 +996,19 @@ class Pipeline:
             except Exception:
                 logger.warning("Context retrieval failed.", exc_info=True)
         return None
+
+
+# ── Module-level helpers ────────────────────────────────────────────
+
+def _overlap_length(text: str, quote: str) -> int:
+    """Longest common substring length (approximate, via sliding window)."""
+    best = 0
+    q_len = len(quote)
+    for start in range(0, len(text) - 10, 10):
+        window = text[start : start + q_len + 20]
+        for i in range(len(window)):
+            k = 0
+            while i + k < len(window) and k < q_len and window[i + k] == quote[k]:
+                k += 1
+            best = max(best, k)
+    return best

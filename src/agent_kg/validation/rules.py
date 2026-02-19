@@ -64,13 +64,13 @@ def check_no_generic_entity_labels(
     return []
 
 
-def check_provenance_non_empty(relation: Relation) -> list[Violation]:
-    """Relations must have a non-empty provenance quote."""
-    if not relation.provenance.quote.strip():
+def check_source_non_empty(relation: Relation) -> list[Violation]:
+    """Relations must have at least one non-empty source quote."""
+    if not relation.source.quotes or not any(q.strip() for q in relation.source.quotes):
         return [Violation(
-            rule_name="provenance_non_empty",
+            rule_name="source_non_empty",
             severity="warning",
-            message=f"Relation '{relation.generic}' has an empty provenance quote.",
+            message=f"Relation '{relation.generic}' has no source quotes.",
             subject_type="relation",
         )]
     return []
@@ -118,12 +118,64 @@ def check_no_duplicate_entities_in_relation(relation: Relation) -> list[Violatio
 
 # ── Master runner ───────────────────────────────────────────────────
 
+def check_quotes_are_verbatim(
+    relation: Relation,
+    document_text: str,
+    chunk_text: str | None = None,
+) -> list[Violation]:
+    """Each source quote must be an exact substring of its source chunk (or document).
+
+    When *chunk_text* is provided (i.e. the relation has a ``chunk_id`` and the
+    chunk text is known), the quote is validated against the **chunk** — a tighter
+    scope that also confirms the chunk assignment is correct.
+
+    Falls back to full document text when chunk text is unavailable.
+
+    Note: in the main pipeline path, verbatimness is enforced during relation
+    extraction via Pydantic validation context (so the LLM is retried
+    automatically). This symbolic rule is a fail-closed backstop.
+    """
+    reference_text = chunk_text if chunk_text else document_text
+    scope = "chunk" if chunk_text else "document"
+
+    if not reference_text:
+        return []  # can't verify without source text
+
+    violations: list[Violation] = []
+    for quote in relation.source.quotes:
+        if quote not in reference_text:
+            violations.append(Violation(
+                rule_name="quote_not_verbatim",
+                severity="error",
+                message=(
+                    f"Relation '{relation.generic}': source quote is not "
+                    f"an exact substring of the source {scope}: "
+                    f"'{quote[:80]}...'"
+                ),
+                subject_type="relation",
+                context={
+                    "document_id": relation.source.document_id,
+                    "chunk_id": relation.source.chunk_id,
+                    "scope": scope,
+                    "quote_preview": quote[:120],
+                },
+            ))
+    return violations
+
+
 def run_symbolic_validation(
     relations: list[Relation],
     blocklist: list[str],
     confidence_threshold: float = 0.3,
+    doc_texts: dict[str, str] | None = None,
+    chunk_texts: dict[str, str] | None = None,
 ) -> list[Violation]:
     """Run all symbolic validation rules on a list of relations.
+
+    Args:
+        chunk_texts: Optional mapping of ``chunk_id → chunk text``.
+            When available, quote-verbatim checks run against the
+            chunk text (tighter scope) instead of the full document.
 
     Returns:
         Flat list of all violations found.
@@ -132,9 +184,18 @@ def run_symbolic_validation(
 
     for relation in relations:
         violations.extend(check_has_agent_and_theme(relation))
-        violations.extend(check_provenance_non_empty(relation))
+        violations.extend(check_source_non_empty(relation))
         violations.extend(check_confidence_threshold(relation, confidence_threshold))
         violations.extend(check_no_duplicate_entities_in_relation(relation))
+
+        # Quote verbatim check — prefer chunk text, fall back to doc text
+        chunk_id = relation.source.chunk_id
+        c_text = chunk_texts.get(chunk_id) if chunk_texts and chunk_id else None
+        doc_text = doc_texts.get(relation.source.document_id, "") if doc_texts else ""
+        if c_text or doc_text:
+            violations.extend(
+                check_quotes_are_verbatim(relation, doc_text, chunk_text=c_text)
+            )
 
         for entity in relation.roles.all_entities():
             violations.extend(check_no_generic_entity_labels(entity, blocklist))
