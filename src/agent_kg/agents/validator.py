@@ -20,6 +20,8 @@ Usage::
 
 from __future__ import annotations
 
+from typing import Literal
+
 import logging
 from dataclasses import dataclass, field
 
@@ -39,7 +41,7 @@ class Resolution:
     """An agent-decided resolution for one violation."""
 
     violation_rule: str
-    action: str  # "correct" | "escalate" | "override"
+    action: Literal["correct", "escalate", "override"]
     reasoning: str
     correction: str | None = None
 

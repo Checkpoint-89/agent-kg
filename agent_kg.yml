@@ -1,0 +1,22 @@
+name: agent-kg
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.11
+  - pydantic>=2.0
+  - instructor>=1.0
+  - openai>=1.0
+  - tiktoken
+  - numpy
+  - scikit-learn
+  - neo4j>=5.0
+  # Optional dependencies for advanced clustering
+  - hdbscan     # optional, for DimReductionClustering
+  - umap-learn  # optional, for DimReductionClustering
+  # Development dependencies
+  - pytest  # optional, for development
+  - pytest-asyncio  # optional, for development
+  - pip
+  - pip:
+    - agent-framework>=0.1.0a0
+      # - ruff  # linter, only available via pip

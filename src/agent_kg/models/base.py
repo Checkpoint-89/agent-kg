@@ -55,6 +55,7 @@ class RelationType(BaseModel):
     )
     verb: str = Field(
         ...,
+        min_length=1,
         description="Infinitive verb phrase describing the interaction or state. No subject or object.",
     )
     target_category: str = Field(
@@ -86,9 +87,8 @@ class RelationType(BaseModel):
 
     @model_validator(mode="after")
     def _compute_label(self) -> RelationType:
-        if self.verb:
-            raw = f"{self.verb}_{self.target_category.strip().replace(' ', '_')}"
-            self.label = sanitize_for_identifier(raw, style="upper")
+        raw = f"{self.verb}_{self.target_category.strip().replace(' ', '_')}"
+        self.label = sanitize_for_identifier(raw, style="upper")
         return self
 
 
