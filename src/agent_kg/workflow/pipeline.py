@@ -868,7 +868,7 @@ class Pipeline:
     ) -> dict[int, list[tuple[str, str, str]]]:
         """Capture original entity (name, label, role) before ER mutates them.
 
-        Returns a mapping of ``id(relation) → [(name, label, role), ...]``
+        Returns a mapping of ``d → [(name, label, role), ...]``
         preserving the order and identity of entities in each relation.
         """
         snapshot: dict[int, list[tuple[str, str, str]]] = {}
