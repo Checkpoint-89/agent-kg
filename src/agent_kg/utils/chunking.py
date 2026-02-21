@@ -34,12 +34,22 @@ class Chunk:
     token_count: int = 0
 
 
-def generate_chunk_id(document_id: str, index: int) -> str:
-    """Deterministic chunk ID from document id + chunk index."""
+def generate_chunk_id(document_id: str, index: int, chunk_text: str) -> str:
+    """Deterministic chunk ID from document id + chunk index + chunk text.
+
+    Including the chunk text makes the id content-sensitive: changing chunking
+    parameters or document text will typically change resulting ids.
+    """
     payload = json.dumps(
-        {"document_id": document_id, "chunk_index": index}, sort_keys=True
+        {
+            "document_id": document_id,
+            "chunk_index": index,
+            "chunk_text": chunk_text,
+        },
+        sort_keys=True,
+        ensure_ascii=False,
     )
-    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def chunk_document(
@@ -75,7 +85,13 @@ def chunk_document(
     enc = tiktoken.get_encoding(encoding_name)
 
     # ── 1. Sentence splitting ───────────────────────────────────────
-    sentences = _split_sentences(text)
+    raw_sentences = _split_sentences(text)
+
+    # Hard-split any sentence that exceeds max_tokens on its own.
+    sentences: list[str] = []
+    for s in raw_sentences:
+        sentences.extend(_hard_split_segment(s, max_tokens, enc))
+
     sent_tokens = [len(enc.encode(s)) for s in sentences]
 
     # ── 2. Greedy window with overlap ───────────────────────────────
@@ -108,7 +124,7 @@ def chunk_document(
 
         chunks.append(
             Chunk(
-                chunk_id=generate_chunk_id(document_id, chunk_index),
+                chunk_id=generate_chunk_id(document_id, chunk_index, chunk_text),
                 document_id=document_id,
                 index=chunk_index,
                 text=chunk_text,
@@ -141,10 +157,13 @@ def chunk_document(
 def _split_sentences(text: str) -> list[str]:
     """Split text into sentence-like segments preserving whitespace.
 
-    Uses a simple regex split after sentence-ending punctuation.
-    Keeps trailing whitespace attached to the sentence so that
-    ``"".join(sentences) == text``.
+    Uses a regex split after sentence-ending punctuation (``. ! ?``).
+    Keeps trailing whitespace attached to the preceding sentence so
+    that ``"".join(segments) == text`` always holds.
     """
+    if not text:
+        return []
+
     parts: list[str] = []
     last = 0
     for m in _SENTENCE_SPLIT.finditer(text):
@@ -154,3 +173,45 @@ def _split_sentences(text: str) -> list[str]:
     if last < len(text):
         parts.append(text[last:])
     return parts
+
+
+def _hard_split_segment(
+    segment: str,
+    max_tokens: int,
+    enc: tiktoken.Encoding,
+) -> list[str]:
+    """Split a single oversized segment into token-bounded pieces.
+
+    Used as a safety net when a "sentence" exceeds *max_tokens*
+    (e.g. very long sentences, no punctuation, bullet lists).
+    Cuts are placed at whitespace boundaries when possible.
+
+    Invariant: ``"".join(result) == segment``.
+    """
+    tokens = enc.encode(segment)
+    if len(tokens) <= max_tokens:
+        return [segment]
+
+    pieces: list[str] = []
+    pos = 0  # character cursor
+
+    while pos < len(segment):
+        # Decode a max_tokens-sized token window back to text to find
+        # the approximate character boundary.
+        remaining_tokens = enc.encode(segment[pos:])
+        if len(remaining_tokens) <= max_tokens:
+            pieces.append(segment[pos:])
+            break
+
+        approx_text = enc.decode(remaining_tokens[:max_tokens])
+        cut = pos + len(approx_text)
+
+        # Try to snap to the nearest whitespace (look back up to 200 chars).
+        snap = segment.rfind(" ", max(pos, cut - 200), cut)
+        if snap > pos:
+            cut = snap + 1  # include the space with the left piece
+
+        pieces.append(segment[pos:cut])
+        pos = cut
+
+    return pieces

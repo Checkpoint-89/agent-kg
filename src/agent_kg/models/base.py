@@ -18,6 +18,7 @@ Role subclasses are deliberately kept (not collapsed into a single generic
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import (
@@ -341,57 +342,86 @@ class Roles(BaseModel):
 # Relation
 # =====================================================================
 
-class Source(BaseModel):
-    """Links a relation back to its source document (and optionally its chunk)."""
+class Evidence(BaseModel):
+    """A single piece of textual evidence anchoring a relation to the source.
 
-    document_id: str = Field(..., description="Source document identifier.")
+    Each evidence item carries its own quote and (after chunk assignment)
+    its own ``chunk_id``, enabling per-quote chunk-scoped validation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    quote: str = Field(
+        ...,
+        min_length=40,
+        description=(
+            "Verbatim excerpt from the source text that evidences the relation. "
+            "Must be an EXACT, copy-paste substring of the source document "
+            "(at least one full sentence)."
+        ),
+    )
     chunk_id: str | None = Field(
         default=None,
         description=(
-            "Chunk identifier within the document.  Set automatically "
-            "when the pipeline uses chunk-level extraction."
-        ),
-    )
-    quotes: list[str] = Field(
-        ...,
-        min_length=1,
-        description=(
-            "Verbatim excerpts from the source text that evidence the relation. "
-            "Each item must be an EXACT, copy-paste substring of the source document "
-            "(at least one full sentence). Multiple quotes are allowed when the "
-            "relation is evidenced in separate passages."
+            "Chunk identifier for this quote.  Set automatically by the "
+            "pipeline after chunking."
         ),
     )
 
-    @field_validator("quotes", mode="after")
+    @field_validator("quote", mode="after")
     @classmethod
-    def _validate_quotes(cls, v: list[str], info: ValidationInfo) -> list[str]:
-        """Validate quote shape and (optionally) verify verbatimness.
+    def _validate_quote(cls, v: str, info: ValidationInfo) -> str:
+        """Strip and verify verbatimness against the source document.
 
         If the caller provides a Pydantic validation context containing
-        `document_text`, each quote must be an exact substring of that
-        document text. This is intended to trigger automatic retries in
-        structured-extraction clients (e.g. instructor) via validation errors.
+        ``document_text``, the quote must be an exact substring.  This
+        triggers automatic retries in instructor via validation errors.
         """
-        cleaned: list[str] = []
+        v = v.strip()
         document_text = ""
         if isinstance(getattr(info, "context", None), dict):
             raw = info.context.get("document_text")
             if isinstance(raw, str):
                 document_text = raw
-        for q in v:
-            q = q.strip()
-            if len(q) < 40:
-                raise ValueError(
-                    f"Quote too short ({len(q)} chars, minimum 40): '{q[:60]}'"
-                )
-            if document_text and q not in document_text:
-                raise ValueError(
-                    "Quote must be an exact, verbatim substring of the source document: "
-                    f"'{q[:80]}...'"
-                )
-            cleaned.append(q)
-        return cleaned
+        if document_text and v not in document_text:
+            raise ValueError(
+                "Quote must be an exact, verbatim substring of the source document: "
+                f"'{v[:80]}...'"
+            )
+        return v
+
+
+class Source(BaseModel):
+    """Links a relation back to its source document with per-quote provenance."""
+
+    document_id: str = Field(..., description="Source document identifier.")
+    evidence: list[Evidence] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Verbatim excerpts from the source text that evidence the relation. "
+            "Each item must be an EXACT, copy-paste substring of the source document "
+            "(at least one full sentence). Multiple items are allowed when the "
+            "relation is evidenced in separate passages."
+        ),
+    )
+
+    # ── Convenience accessors (backward compat) ─────────────────────
+
+    @property
+    def quotes(self) -> list[str]:
+        """All quote texts (read-only shortcut)."""
+        return [e.quote for e in self.evidence]
+
+    @property
+    def chunk_id(self) -> str | None:
+        """First evidence chunk_id (backward compat for single-chunk code)."""
+        return self.evidence[0].chunk_id if self.evidence else None
+
+    @property
+    def chunk_ids(self) -> list[str | None]:
+        """Per-evidence chunk ids."""
+        return [e.chunk_id for e in self.evidence]
 
 
 class RawRelation(BaseModel):
@@ -499,6 +529,28 @@ class Relation(BaseModel):
         if self.metadata is None:
             self.metadata = {}
         self.metadata.update(extra)
+
+
+# =====================================================================
+# Mentions (surface forms)
+# =====================================================================
+
+@dataclass(frozen=True)
+class Mention:
+    """A surface-form occurrence of an entity within a chunk.
+
+    Separates the *mention* (what the text says) from the *entity*
+    (what it refers to after resolution). This enables non-destructive
+    entity resolution: original surface forms are preserved as Mention
+    records even after canonical merging.
+    """
+
+    mention_id: str
+    surface_form: str  # original entity name before ER
+    entity_name: str  # canonical entity name after ER
+    entity_label: str  # canonical entity label after ER
+    chunk_id: str | None  # chunk this mention belongs to
+    role: str  # semantic role in the relation (e.g. "agent")
 
 
 # =====================================================================

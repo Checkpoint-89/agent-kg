@@ -8,7 +8,7 @@ Graph topology (diamond)::
 
     (Document)──HAS_CHUNK──►(Chunk)──HAS_MENTION──►(Mention)──REFERS_TO──►(Entity)
                                 │                                              ▲
-                                └──EXTRACTED_FROM──(Relation)──<ROLE>───────────┘
+                                └──EXTRACTED_FROM──(Relation)──<ROLE>──────────┘
 
 Two independent paths from Chunk to Entity form a **diamond**:
 
@@ -34,7 +34,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from agent_kg.models.base import Entity, Relation
+from agent_kg.models.base import Entity, Mention, Relation
 from agent_kg.utils.chunking import Chunk
 
 logger = logging.getLogger(__name__)
@@ -61,28 +61,6 @@ class GraphEdge:
     target_id: str
     relation_type: str
     properties: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class Mention:
-    """A surface-form occurrence of an entity within a chunk.
-
-    Separates the *mention* (what the text says) from the *entity*
-    (what it refers to after resolution).  This enables non-destructive
-    entity resolution: original surface forms are preserved as Mention
-    nodes even after canonical merging.
-
-    Graph edges::
-
-        (Chunk)-[:HAS_MENTION]->(Mention)-[:REFERS_TO]->(Entity)
-    """
-
-    mention_id: str
-    surface_form: str       # original entity name before ER
-    entity_name: str        # canonical entity name after ER
-    entity_label: str       # canonical entity label after ER
-    chunk_id: str | None    # chunk this mention belongs to
-    role: str               # semantic role in the relation (e.g. "agent")
 
 
 # =====================================================================
@@ -268,15 +246,17 @@ def build_graph_elements(
         rel_node = _relation_node(relation)
         nodes[rel_node.id] = rel_node
 
-        # Relation → Chunk (preferred) or Relation → Document (fallback)
-        chunk_id = relation.source.chunk_id
-        if chunk_id and chunk_id in chunk_id_set:
-            edges.append(GraphEdge(
-                source_id=rel_node.id,
-                target_id=chunk_id,
-                relation_type="EXTRACTED_FROM",
-            ))
-        else:
+        # Relation → Chunk(s) (preferred) or Relation → Document (fallback)
+        linked_to_chunk = False
+        for evidence_chunk_id in relation.source.chunk_ids:
+            if evidence_chunk_id and evidence_chunk_id in chunk_id_set:
+                edges.append(GraphEdge(
+                    source_id=rel_node.id,
+                    target_id=evidence_chunk_id,
+                    relation_type="EXTRACTED_FROM",
+                ))
+                linked_to_chunk = True
+        if not linked_to_chunk:
             edges.append(GraphEdge(
                 source_id=rel_node.id,
                 target_id=doc_node.id,

@@ -158,7 +158,7 @@ def _cluster_groups(
 
     # Merge Stage-1 groups that land in the same Stage-2 cluster
     merged: list[list[_Mention]] = []
-    for _cid, indices in cluster_map.items():
+    for _, indices in cluster_map.items():
         combined: list[_Mention] = []
         for idx in indices:
             combined.extend(groups[group_keys[idx]])

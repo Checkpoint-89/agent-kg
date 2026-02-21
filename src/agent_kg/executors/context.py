@@ -208,7 +208,7 @@ class ContextRetriever:
 
         # Keep top-K by score
         sorted_ids = sorted(
-            matched_chunk_ids, key=matched_chunk_ids.get, reverse=True,  # type: ignore[arg-type]
+            matched_chunk_ids, key=matched_chunk_ids.get, reverse=True,
         )[:max_chunks]
 
         # 4. Traverse: Chunk ← Relation → Entity

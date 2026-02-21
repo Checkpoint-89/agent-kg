@@ -43,12 +43,11 @@ from agent_kg.agents.validator import (
 from agent_kg.config import DomainConfig
 from agent_kg.executors.context import ContextRetriever, GraphContext
 from agent_kg.executors.entity_resolution import resolve_entities
-from agent_kg.models.base import CandidateType, RawRelation, Relation, ResolutionReport
+from agent_kg.models.base import CandidateType, Mention, RawRelation, Relation, ResolutionReport
 from agent_kg.models.graph import (
     GraphEdge,
     GraphExporter,
     GraphNode,
-    Mention,
     Neo4jExporter,
     build_graph_elements,
     generate_id,
@@ -834,32 +833,34 @@ class Pipeline:
         relations: list[Relation],
         doc_chunks: dict[str, list[Chunk]],
     ) -> None:
-        """Set ``source.chunk_id`` on each relation.
+        """Set ``chunk_id`` on each evidence item.
 
-        For each relation we find the chunk whose text contains the
-        first quote.  If no chunk matches (e.g. quote spans a boundary),
+        For each evidence quote we find the chunk whose text contains
+        the quote.  If no chunk matches (e.g. quote spans a boundary),
         we pick the chunk with the largest overlap.
         """
         for rel in relations:
             chunks = doc_chunks.get(rel.source.document_id, [])
             if not chunks:
                 continue
-            quote = rel.source.quotes[0] if rel.source.quotes else ""
-            if not quote:
-                continue
 
-            # Exact containment (fast path)
-            for chunk in chunks:
-                if quote in chunk.text:
-                    rel.source.chunk_id = chunk.chunk_id
-                    break
-            else:
-                # Largest overlap heuristic
-                best_chunk = max(
-                    chunks,
-                    key=lambda c: _overlap_length(c.text, quote),
-                )
-                rel.source.chunk_id = best_chunk.chunk_id
+            for evidence in rel.source.evidence:
+                quote = evidence.quote.strip()
+                if not quote:
+                    continue
+
+                # Exact containment (fast path)
+                for chunk in chunks:
+                    if quote in chunk.text:
+                        evidence.chunk_id = chunk.chunk_id
+                        break
+                else:
+                    # Largest overlap heuristic
+                    best_chunk = max(
+                        chunks,
+                        key=lambda c: _overlap_length(c.text, quote),
+                    )
+                    evidence.chunk_id = best_chunk.chunk_id
 
     @staticmethod
     def _snapshot_surface_forms(
@@ -897,8 +898,11 @@ class Pipeline:
 
         Each entity occurrence becomes a Mention linking the original
         surface form (from the snapshot) to the canonical entity (current
-        state after resolution).  The chunk_id comes from the relation's
-        source (set by ``_assign_chunk_ids``).
+        state after resolution).
+
+        The chunk_id is taken from the relation's *first* evidence item
+        (best-effort locality).  In the future, entity-level offsets could
+        pin each mention to its exact evidence item.
         """
         mentions: list[Mention] = []
         seen: set[str] = set()  # deduplicate by mention_id
@@ -907,11 +911,13 @@ class Pipeline:
             original_forms = surface_snapshot.get(id(rel), [])
             canonical_entities = rel.roles.all_entities()
 
+            # Best-effort chunk: first evidence item's chunk_id
+            chunk_id = rel.source.chunk_id
+
             # Both lists have the same length and order (ER mutates in-place).
             for (orig_name, orig_label, role), entity in zip(
                 original_forms, canonical_entities, strict=False,
             ):
-                chunk_id = rel.source.chunk_id
                 mid = generate_mention_id(
                     chunk_id, orig_name, entity.name, entity.label,
                 )

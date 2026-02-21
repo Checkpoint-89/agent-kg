@@ -65,7 +65,14 @@ class AgglomerativeStrategy(ClusteringStrategy):
         linkage: Linkage criterion (``"average"`` recommended for cosine).
     """
 
-What 
+    def __init__(
+        self,
+        distance_threshold: float = 0.25,
+        linkage: str = "average",
+    ) -> None:
+        self.distance_threshold = distance_threshold
+        self.linkage = linkage
+
 
     def fit(self, embeddings: np.ndarray) -> dict[int, list[int]]:
         if len(embeddings) < 2:
