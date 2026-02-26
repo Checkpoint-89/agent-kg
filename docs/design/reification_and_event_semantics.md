@@ -59,6 +59,22 @@ Once you have relation nodes, you need a vocabulary for the edges. Fillmore's Ca
 **What this means in practice:**
 - Role labels stay generic (Agent/Theme/…), and specialization lives primarily in the **ontology** (relation types + entity types/labels), not in role names.
     This still lets us recover distinctions like Buyer vs. Seller indirectly via (a) the discovered relation type, (b) the types/labels of the participants that fill roles, and (c) the role-composition-based specialization described in [relation specialization](relation_specialization.md).
+
+    **Example.** "ACME Corp purchased 10 000 units from WidgetCo." produces:
+
+    ```
+    (r:PURCHASE_GOODS)
+        --Agent-->  ACME Corp   [label: Organisation]
+        --Theme-->  10 000 units [label: Product]
+        --Origin--> WidgetCo    [label: Organisation]
+    ```
+
+    The roles are generic (`Agent`, `Theme`, `Origin`), but we can still tell who is the buyer and who is the seller:
+    - The **relation type** is `PURCHASE_GOODS` → the Agent is the buyer by definition.
+    - The **entity labels** distinguish Organisation from Product.
+    - A **specialization rule** (see [relation_specialization.md](relation_specialization.md)) can make this explicit: `PURCHASE_GOODS` + Agent:`Organisation` + Origin:`Organisation` → subtype `Procurement`.
+
+    A FrameNet-style upgrade (v2) would rename the slots directly: `Buyer`, `Goods`, `Seller` — but v1 gets the same information through composition.
 - Constraints (required/optional roles) live in **validation rules**, not in a first-class per-relation-type role schema.
     We can already enforce per-type constraints via `DomainConfig.validation_rules` (predicates that branch on relation type). The main trade-off is ergonomics/maintainability: a declarative per-type role schema (FrameNet-style) would make such constraints easier to author, review, and evolve.
 
