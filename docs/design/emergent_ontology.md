@@ -41,9 +41,9 @@ Un régime relationnel regroupe des relations qui partagent : une même logique 
 
 ---
 
-## Overview
+## Overview [Relational regime]
 
-The ontology in this system is **emergent**: it is not defined up-front and frozen, but discovered from data and continuously reshaped through six operations organised along three axes — **vertical** (abstraction / specialisation), **horizontal** (deduplication / disambiguation), **compositional** (decomposition / recomposition). This document formalises the graph model, the operations, their coupling, and the convergence regime that prevents runaway divergence. The third axis is not implemented for the time being.
+The ontology in this system is **emergent**: it is not defined up-front and frozen, but discovered from data and continuously reshaped through four operations organised along two axes — **vertical** (abstraction / specialisation), **horizontal** (deduplication / disambiguation). This document formalises the graph model, the operations, their coupling, and the convergence dynamics that prevents runaway divergence. The third axis is not implemented for the time being.
 
 It synthesises and extends the mechanisms described in [ontology_type_splitting.md](ontology_type_splitting.md), [drift_management.md](drift_management.md), and [relation_granularity.md](relation_granularity.md).
 
@@ -88,8 +88,6 @@ What distinguishes one instance from another under the same Type is its **partic
 
 A **property** is a named feature declared at the Type level whose **value** is set per instance. Properties are the shared attributes of a Type; their values define the specifics of one of its instances. For example, a Type `EMPLOYMENT` might declare properties `start_date`, `end_date`, `title`; each `EMPLOYMENT` instance carries its own values for those properties.
 
-Properties are the user facing internal details of the type. The type could be itself decomposed into sub-types, this is not implemented here.
-
 ### 1.3 Identity
 
 A separate, first-class node representing a **persistent real-world referent**.
@@ -133,6 +131,7 @@ Right now the system assumes an entity/relation KG: the `type_kind` values, the 
 
 ### 2.1 The (R,T) feature space — primary clustering substrate
 
+[TODO: introduce tfidf]
 For any set of instances under study $\mathcal{I}$ (e.g., all instances of a Type $T$, or the union $T_a \cup T_b$), define the **axis set** as the (Role, Type) pairs actually observed across $\mathcal{I}$:
 
 $$\mathcal{A}(\mathcal{I}) = \bigl\{(R_i, T_j) \;\big|\; \exists\, x \in \mathcal{I} \text{ such that } x \text{ participates in role } R_i \text{ with a } T_j\text{-typed counterpart}\bigr\}$$
@@ -164,9 +163,9 @@ $f$ must be deterministic for a given input. Re-embedding with a different model
 
 ---
 
-## 3. Ontology operations — the six operations
+## 3. Ontology operations — the four operations
 
-The emergent ontology evolves through six operations. Four form a 2×2 matrix along two axes (vertical/horizontal). Two form the compositional axis (decomposition/recomposition).
+The emergent ontology evolves through four operations. Four form a 2×2 matrix along two axes (vertical/horizontal).
 
 ### 3.1 The 2×2 matrix
 
@@ -177,232 +176,165 @@ The emergent ontology evolves through six operations. Four form a 2×2 matrix al
 
 All four are driven by the same clustering / embedding machinery and validated by the Arbiter. They differ in the **label trail semantics** applied after the decision.
 
-### 3.2 Decomposition (compositional split)
 
-A Type that is not merely over-general (vertical) nor accidentally conflated (horizontal) but is a **composite** of two functionally distinct, conceptually adjacent concepts.
+### 3.2 Candidate selection
 
-**Example:** `SIGN_CONTRACT` is found to blend two distinct processes — `NEGOTIATE_CONTRACT` and `EXECUTE_CONTRACT`. Neither is a specialisation of `SIGN_CONTRACT` (vertical), nor is `SIGN_CONTRACT` a spurious homonym (horizontal). The concept is a genuine **composite**: a macro-event that the ontology should decompose into its functional constituents.
+The ontology operations described in §4–§5 require **candidate Types or candidate pairs** to investigate.  
+Detection begins with a shared **Type-level structural pre-screening** that routes each Type toward the split or merge pipeline.
 
-**Trigger:** the Arbiter, during a split validation, determines that the proposed sub-clusters are not in a parent–child relationship (vertical) nor unrelated homonyms (horizontal), but are **functionally distinct phases or facets** of a single composite concept.
+---
 
-**Mechanics:**
+#### 3.2.1 Phase 1 — Structural pre-screening (per Type)
 
-1. The parent Type is retired.
-2. Each child receives a fresh label — no inherited ancestry from the parent (same as horizontal disambiguation).
-3. A **typed meta-relation** may be created between the sibling Types to record their functional relationship (e.g., `NEGOTIATE_CONTRACT --precedes--> EXECUTE_CONTRACT`). This meta-relation is a first-class relation-kinded Type in the ontology.
-4. Instances of the parent are re-classified to the appropriate child based on cluster assignment.
+For every Type $T$ with instance count $N \geq N_{\min}$:
 
-**Label trail:** parent label is retired. Children get independent trails. The meta-relation between siblings captures the structural link that the shared parent label used to encode implicitly.
+1. Build its (R,T) feature matrix (§2.1) from instance-level event motifs $(role \rightarrow type)$.
+2. Compute:
+   - Structural variance (or Jaccard dispersion),
+   - Silhouette score under agglomerative clustering.
 
-**Distinction from other splits:**
+The pair of signals determines routing:
 
-| Criterion | Vertical specialisation | Horizontal disambiguation | Decomposition |
-|-----------|--------------------|-----------------------------|----------------|
-| Parent coherence | Coherent concept | Spurious conflation | Genuine composite |
-| Children relationship | Specialisations of parent | Unrelated peers | Functionally distinct facets |
-| Label trail | Parent preserved as ancestor | Parent retired | Parent retired |
-| Meta-relation between children | None | None | Yes (functional link) |
+| Variance | Silhouette | Diagnostic   | Action                                  |
+|:--------:|:----------:|:------------|:------------------------------------------|
+| +        | +          | Split likely | Confirm via split pipeline                |
+| −        | +          | Well-formed  | No action                                 |
+| +        | −          | Ambiguous    | Test split first, merge second            |
+| −        | −          | Merge likely | Escalate to merge screening               |
 
+**Principle:** Always evaluate split before merge in ambiguous cases.
 
-### 3.3 Recomposition (compositional merge; inverse of decomposition)
+---
 
-Recomposition fuses two or more Types that were separate but turn out to **always co-occur in a stable pattern**, forming a compound concept that deserves its own Type.
+#### 3.2.2 Split path (specialisation, disambiguation)
 
-This is distinct from:
-- **Vertical abstraction** (one subsumes the other — hierarchy).
-- **Horizontal deduplication** (they are synonyms — identity).
+If routed toward split:
 
-Recomposition says: the Types are genuinely different concepts, but they form a **stable compound** — they co-occur so systematically that treating them as a single unit improves both parsimony and structural clarity.
+1. Run agglomerative clustering.
+2. Select the dendrogram cut maximising silhouette.
+3. If $s(T) \geq \theta_{\text{split}}$ and $k \geq 2$, surface $T$ to the Arbiter.
 
-**Example:** `NEGOTIATE_CONTRACT` and `EXECUTE_CONTRACT` always appear together with the same participants and temporal sequence. The system recomposes them into `CONTRACT_PROCESS`, a single composite Type.
+**Emergent splits:**  
+If dispersion is locally suspicious but global separation is weak:
+- Apply a lightweight dispersion heuristic [TODO: define the lightweight dispersion heuristic].
+- Escalate to HDBSCAN.
+- Stable, non-marginal clusters are surfaced.
 
-**Trigger:** diagnostic signals include:
-- Two or more Types of the same `type_kind` exhibit a **near-perfect co-occurrence** at the instance level: whenever an instance of $T_a$ exists, an instance of $T_b$ exists with the same (or overlapping) role fillers.
-- The inter-type meta-relation (if one exists from a prior decomposition) has become structurally trivial — it carries no additional information beyond "these always go together."
-- The Arbiter judges that the compound is conceptually coherent as a single concept.
+The Arbiter determines whether the candidate corresponds to:
+- Specialisation,
+- Disambiguation,
+- or rejection.
 
-**Mechanics:**
+---
 
-1. A new composite Type is created with a fresh label.
-2. The source Types are retired; their labels are recorded as aliases.
-3. Instances are merged pairwise (matched by co-occurrence) into instances of the composite Type. Property values are reconciled.
-4. Any meta-relation linking the source Types is dissolved.
-5. Role edges from other Types that pointed to the source Types are redirected to the composite Type.
+#### 3.2.3 Merge path (abstraction, deduplication)
 
-**Label trail:** source labels are retired. The composite Type gets a fresh trail.
+If routed toward merge:
 
-**Distinction from other merges:**
+1. Apply TF-IDF structural similarity screening.
+2. Pairs passing thresholds proceed to instance-level separability testing.
+3. Inseparable pairs are surfaced to the Arbiter for abstraction, deduplication, or rejection.
 
-| Criterion | Vertical abstraction | Horizontal deduplication | Recomposition |
-|-----------|---------------------|---------------------------|----------------|
-| Relationship | One subsumes the other | Same concept (synonym) | Different concepts, stable compound |
-| Label trail | Subsumee retained as alias | Both retire, one canonical chosen | Both retire, new composite label |
-| Hierarchy created | Yes (parent–child) | No | No |
-| Meta-relation | N/A | N/A | Dissolved (was the co-occurrence link) |
+This staged routing keeps candidate detection tractable as the ontology grows.
 
-### 3.4 Candidate selection
+**Type-level structural matrix**
 
-The ontology operations described in §4–§5 require **candidate pairs or candidate Types** to investigate. The selection strategy differs between split and merge families.
+For each Type $T$, build a TF-IDF-weighted vector over the aggregate motif space:
 
-#### 3.4.1 Split candidates (specialisation, disambiguation, decomposition)
+$$
+M_{T,(R,T')} = \text{TF-IDF weight of motif } (R,T')
+$$
 
-Split candidate selection scans **each Type independently**:
+This vector is computed over the Type’s instance-level event profiles and reflects how characteristic each $(R,T')$ motif is for that Type.
 
-1. For every Type $T$ with instance count $N \geq N_{\min}$, build its (R,T) feature matrix (§2.1) and run the dendrogram / silhouette test (§4.1.1).
-2. Types with $s(T) \geq \theta_{\text{split}}$ and $k \geq 2$ are surfaced as candidates.
+---
 
-This is $O(|\mathcal{T}|)$ — linear in the number of Types — and the instance count threshold $N_{\min}$ eliminates Types with too few observations for reliable clustering. The Arbiter then determines whether a surfaced candidate is a specialisation (§4.1), disambiguation (§5.1), or decomposition (§3.2) based on the semantic relationship between sub-clusters.
-
-#### 3.4.2 Merge candidates (abstraction, deduplication, recomposition)
-
-Merge candidate selection must identify **pairs** $(T_a, T_b)$ of the same `type_kind` that are worth investigating. The naïve space is $O(|\mathcal{T}|^2)$ — potentially large. Three complementary screening signals reduce it to a short list:
+**Primary screening signal**
 
 | Signal | What it computes | Cost | Rationale |
 |--------|-----------------|------|-----------|
-| **Conceptual proximity** | Cosine similarity between the definition embeddings of $T_a$ and $T_b$ | $O(|\mathcal{T}|^2)$ over precomputed vectors — cheap | Types with distant definitions are unlikely merge candidates. |
-| **Structural (R,T) overlap** | Set-overlap score (e.g., Jaccard) between $\mathcal{A}(T_a)$ and $\mathcal{A}(T_b)$ — the aggregate (R,T) axis sets at the Type level, not instance level | $O(|\mathcal{T}|^2)$ over small sets — cheap | Types whose instances participate in entirely different role–type configurations are not candidates. |
-| **Role adjacency** | Frequency with which $T_a$ and $T_b$ are linked via the same roles to the same counterpart Types | Readable from graph topology — cheap | Types that systematically appear in the same relational contexts may be duplicates or abstractions of each other. |
+| **Structural similarity** | Cosine similarity between TF-IDF(Type, motif) vectors | $O(|\mathcal{T}|^2)$ over compact vectors — cheap | Types with highly similar structural signatures may be duplicates or abstractions. |
 
-**Screening protocol:**
-
-1. Compute all three signals for every same-`type_kind` pair.
-2. A pair must pass **at least two of three** screening thresholds to advance to the instance-level test (the silhouette separability test of §4.2.1).
-3. For pairs that pass screening, build the (R,T) feature matrix over $T_a \cup T_b$ and run the separability test.
-4. Inseparable pairs are surfaced to the Arbiter, which determines whether the merge is an abstraction (§4.2), deduplication (§5.2), or recomposition (§3.4).
-
-This two-stage design — cheap Type-level screening followed by expensive instance-level testing — keeps the merge scan tractable even as the ontology grows.
-
-#### 3.4.3 Recomposition candidates
-
-Recomposition (§3.4) additionally requires a **co-occurrence signal**: pairs of Types whose instances systematically co-occur with the same (or overlapping) role fillers. This is detected by:
-
-1. For each pair of same-`type_kind` Types, compute the fraction of instances of $T_a$ that co-occur with an instance of $T_b$ sharing at least one role filler.
-2. Pairs above a co-occurrence ratio threshold $\theta_{\text{cooccur}}$ are surfaced as recomposition candidates.
-3. The Arbiter judges whether the co-occurrence is structural (→ recompose) or coincidental.
-
-This scan piggybacks on the merge screening infrastructure (§3.6.2) — co-occurrence is a fourth signal that specifically gates the recomposition path.
+Pairs exceeding a structural similarity threshold $\theta_{\text{merge}}$ advance to instance-level separability testing.
 
 ---
 
-## 4. Vertical operations
+**Secondary semantic filter**
 
-### 4.1 Specialisation (vertical split)
+| Signal | What it computes | Purpose |
+|--------|-----------------|----------|
+| **Conceptual similarity** | Cosine similarity of definition embeddings | Prevent structurally similar but semantically distant merges |
 
-Specialisation splits a Type when its instances are no longer homogeneous.
-
-#### 4.1.1 Endogenous specialisation
-
-**Trigger:** for a Type $T$ with $N$ mapped instances:
-
-1. Build the (R,T) feature matrix over all instances of $T$, with axes $\mathcal{A}(\text{instances}_T)$ as defined in §2.1.
-2. Run agglomerative clustering (e.g., Ward or average linkage with Jaccard distance) to produce a dendrogram.
-3. Cut the dendrogram at successive levels and compute the silhouette score $s$ for each resulting partition.
-4. Select the cut that maximises $s$. If $s(T) \geq \theta_{\text{split}}$ and the best partition has $k \geq 2$ clusters, surface $T$ as a **split candidate** with $k$ proposed sub-types.
-
-$$s(T) = \max_{\text{cuts}} \; \text{silhouette\_score}\bigl(\text{(R,T) features of instances}_T,\; \text{partition at cut}\bigr)$$
-
-The dendrogram provides interpretable structure: the (R,T) axes that drive each split are identifiable, and the hierarchy of cuts tells the Arbiter whether the split is a clean two-way division or a deeper cascade.
-
-**Validation gate:** the Arbiter receives the existing Type, its definition, representative examples from each proposed sub-cluster, the distinguishing (R,T) axes, and the silhouette evidence. It decides whether the split is semantically meaningful or an artefact of surface variation, using the `split_type` tool.
-
-**Minimum cluster fraction:** a split into a cluster of 2 and a cluster of 500 is noise. Enforce a minimum fraction $\phi_{\min}$ (e.g., 10%) per sub-cluster before surfacing.
-
-**Temporal scope:** clustering operates over the **accumulated graph** (not a single batch). This is a post-ingestion, graph-level analysis triggered periodically or on demand — not per-batch. See [ontology_type_splitting.md](ontology_type_splitting.md).
-
-**Label trail:** the parent label is preserved; each child appends its own. E.g., `EMPLOYS → ["EMPLOYS", "EMPLOYS_GOV"]`.
-
-#### 4.1.2 Exogenous specialisation
-
-Specialising a Type modifies the structural signatures visible on Types linked to it via roles:
-
-- Splitting Type $E$ (`entity`) into $E_1, E_2$ changes the role signatures of every Type (`relation`) whose instances link to $E$-typed instances. Some relation Types may now exhibit internal bimodality that the coarser typing masked.
-- Splitting Type $R$ (`relation`) into $R_1, R_2$ changes the relational profiles of every Type (`entity`) whose instances participate in $R$-typed instances.
-
-Because all Types share the same node structure, exogenous propagation traverses a uniform role graph. The cascade protocol (§6.5) governs depth.
-
-### 4.2 Abstraction (vertical merge)
-
-Abstraction is the **dual** of specialisation: it merges Types whose instances are no longer distinguishable.
-
-#### 4.2.1 Endogenous abstraction
-
-**Trigger:** for a pair of Types $(T_a, T_b)$ of the same `type_kind`:
-
-1. **Pre-filter (conceptual):** compute cosine similarity between the definition embeddings of $T_a$ and $T_b$. If below a threshold $\theta_{\text{merge\_screen}}$, skip — the Types are conceptually distant and not worth investigating at the instance level.
-2. **Build the (R,T) feature matrix** over all instances of $T_a \cup T_b$, with axes $\mathcal{A}(\text{instances}_{T_a} \cup \text{instances}_{T_b})$ as defined in §2.1.
-3. **Separability test:** assign each instance to a group by its current Type label ($T_a$ or $T_b$). Compute the silhouette score $s$ of this **given** two-group partition ($k=2$ is not searched — it is fixed by the Type labels).
-   - **Low $s$** (below $\theta_{\text{split}}$): the two populations overlap in (R,T) space — they are not structurally distinguishable → **merge candidate**.
-   - **High $s$**: the populations separate cleanly — the distinguishing (R,T) axes are real → **do not merge**.
-
-Operationally, a periodic **merge scan** (the inverse of the split scan):
-
-1. Embed all ontology Type definitions (conceptual axis only).
-2. Flag pairs with high inter-type definition similarity (pre-filter).
-3. For each flagged pair, build the (R,T) feature matrix and run the separability test.
-4. If inseparable, surface a merge proposal to the Arbiter.
-
-**Validation gate:** same Arbiter pattern. The Arbiter receives both Types, their definitions, the shared and distinguishing (R,T) axes, and representative instances from each. It decides via `merge_with_existing` whether the merge is semantically justified or if the structural overlap is coincidental.
-
-**Label trail:** one Type subsumes the other. The subsumed label may be retained as an alias in the trail.
-
-#### 4.2.2 Exogenous abstraction
-
-Symmetric to exogenous specialisation: merging two Types collapses role-signature distinctions that other Types relied on, potentially triggering merge cascades on the other side.
-
-#### 4.2.3 Relationship to existing mechanisms
-
-| Mechanism | Scope | When |
-|-----------|-------|------|
-| Arbiter `merge_with_existing` | Fires when a **new candidate** arrives that resembles an existing Type | Per-batch, during ontology negotiation |
-| Merge scan | Fires between **existing** Types that have converged over time | Periodic, post-ingestion |
-| Abstraction (general) | Generalises both: any structural convergence, whether from new data or accumulated drift | Periodic |
+Conceptual similarity acts as a semantic guardrail; structural similarity remains the primary driver.
 
 ---
 
-## 5. Horizontal operations
+**Protocol**
 
-### 5.1 Disambiguation (horizontal split)
+1. Compute cosine similarity over TF-IDF(Type, motif) vectors for all same-`type_kind` pairs.
+2. Retain pairs with similarity $\ge \theta_{\text{merge}}$.
+3. Apply conceptual similarity as a semantic filter.
+4. For surviving pairs, build the joint instance matrix over $T_a \cup T_b$ and run separability testing.
+5. Inseparable pairs are surfaced as merge candidates to the Arbiter.
 
-Disambiguation separates a Type whose instances cluster into groups that are **conceptually unrelated** — the parent label was a conflation, not a coherent category.
+This two-stage design — structural screening followed by instance-level validation — keeps merge detection tractable while remaining structurally principled.
 
-#### 5.1.1 Distinction from vertical specialisation
+---
 
-The clustering evidence (silhouette, bimodality) is the same. The difference is in the **Arbiter's semantic judgement**:
+## 4. Semantic interpretation (Arbiter classification)
 
-| Criterion | Vertical specialisation | Horizontal disambiguation |
-|-----------|--------------------|-----------------------------|
-| Parent coherence | Parent names a real concept; children are specialisations | Parent was a spurious grouping; children share nothing but a surface label |
-| Label trail | Parent label preserved as ancestor | Parent label **retired** (marked as dissolved conflation) |
-| Example | `EMPLOYS → EMPLOYS_GOV + EMPLOYS_PRIVATE` | `BANK → FINANCIAL_BANK + RIVER_BANK` |
+Candidates are semantically classified by the Arbiter.
 
-#### 5.1.2 Mechanics
+---
 
-1. The split scan surfaces the candidate identically to §4.1.1.
-2. The Arbiter is presented with the sub-clusters and judges whether the parent concept is coherent.
-3. If the Arbiter determines the parent is a conflation:
-   - The parent Type is retired (not preserved as an ancestor).
-   - Each child receives a fresh label trail with no inherited ancestry from the retired parent.
+### 4.1 Split classification
 
-### 5.2 Deduplication (horizontal merge)
+Given candidates, the Arbiter decides:
 
-Deduplication unifies two Types that are **the same concept** but entered the ontology through different ingestion paths — neither is a generalisation of the other; they are peers that should have been one Type from the start.
+| Classification | Meaning | Label policy |
+|---------------|----------|--------------|
+| **Specialisation** | Parent Type is coherent; children refine it | Parent label retained in label trail |
+| **Disambiguation** | Parent was a conflation | Parent label retired |
 
-#### 5.2.1 Distinction from vertical abstraction
+---
 
-| Criterion | Vertical abstraction | Horizontal deduplication |
-|-----------|---------------------|---------------------------|
-| Relationship | One subsumes the other (generalisation) | Both are the same concept (synonym) |
-| Label trail | Subsumee may be retained as alias under the merged type | Both labels retire; one canonical label is chosen |
-| Hierarchy created | Yes (parent–child) | No |
+### 4.2 Merge classification
 
-#### 5.2.2 Mechanics
+Given a structural Merge, the Arbiter decides:
 
-1. The merge scan surfaces the candidate identically to §4.2.1.
-2. The Arbiter judges whether the two Types represent distinct concepts at different abstraction levels (vertical) or the same concept (horizontal).
-3. If horizontal:
-   - One canonical label is chosen; the other is recorded as a retired synonym.
-   - Instance populations are merged under the canonical Type.
-   - No parent–child hierarchy is created.
+| Classification | Meaning | Label policy |
+|---------------|----------|--------------|
+| **Abstraction** | One Type generalises the other | Parent–child relation recorded |
+| **Deduplication** | Both Types represent the same concept | One canonical label retained |
+
+
+## 5. Structural operations
+
+All ontology evolution reduces to two structural operations:
+
+- **Split** (one Type → several)
+- **Merge** (several Types → one)
+
+Candidate detection are defined in §3 and final decision in §4.  
+This section defines the structural transformation and its graph effects.
+
+---
+
+### 5.1 Split
+
+A Split replaces a Type $T$ with $k \ge 2$ new Types $T_1, \dots, T_k$.
+
+**Input:**  
+- Structural clustering evidence (§3)
+- The semantic interpretation of the Split is determined by the Arbiter (§4.1).
+- Partition of instances into $k$ clusters  
+
+**Transformation:**
+
+1. Create new Types $T_1, \dots, T_k$.
+2. Reassign each instance of $T$ to its cluster Type.
+3. Update all role references pointing to $T$ so they now reference the appropriate $T_i$.
+4. Mark $T$ as superseded.
 
 ---
 
